@@ -109,6 +109,11 @@ static struct xio_ev_data trigger_event;
 static inline int ceph_rcvd_msg_add_sg(struct xio_rcvd_msg_hdlr *hdlr, void *buf, int len);
 static void ceph_rdma_trigger_send_on_conn(void *data);
 static int ceph_rdma_xio_reboot(struct notifier_block *nb, unsigned long event, void *ptr);
+static int ceph_rdma_on_new_msg(struct xio_session *session,
+		struct xio_msg *msg, int more_in_batch, void *cb_user_context);
+static void ceph_xio_unmap_data_pages(struct ceph_msg *m);
+static int ceph_rdma_send(struct ceph_connection *con);
+static inline void ceph_rdma_try_sending(struct libceph_rdma_connection *conn, int from_complete);
 
 extern void con_fault(struct ceph_connection *con);
 extern bool ceph_msg_data_advance(struct ceph_msg_data_cursor *cursor, size_t bytes);
@@ -131,6 +136,50 @@ static int ceph_rdma_xio_reboot(struct notifier_block *nb, unsigned long event, 
 {
 	printk("%s:%d: Reboot notifier called. event = %lu\n", __func__, __LINE__, event);
 	return (NOTIFY_OK);
+}
+
+static void ceph_rdma_dump_vmsg_hdr(struct xio_iovec *hdr)
+{
+	trace_printk("HDR: base = %p, len = %zu\n", hdr->iov_base,
+			hdr->iov_len);
+}
+
+static void ceph_rdma_dump_sg_tbl(struct sg_table *data_tbl)
+{
+	int i;
+	struct scatterlist *sg;
+	trace_printk("SG TBL: nents: %d, org nents: %d\n", data_tbl->nents, data_tbl->orig_nents);
+        sg = data_tbl->sgl;
+	for (i = 0; i < data_tbl->nents; i++) {
+                trace_printk("%d: %p, %d\n", i, sg_virt(sg), sg->length);
+		sg = sg_next(sg);
+	}
+}
+
+static void ceph_rdma_dump_vmsg(char *str, struct xio_vmsg *vmsg)
+{
+	trace_printk("%s vmsg: %p\n", str, vmsg);
+	ceph_rdma_dump_vmsg_hdr(&vmsg->header);
+	trace_printk("sgl ty:%d, pad: %d\n", vmsg->sgl_type, vmsg->pad);
+	ceph_rdma_dump_sg_tbl(&vmsg->data_tbl);
+	trace_printk("USR CTX: %p\n", vmsg->user_context);
+}
+
+static void ceph_rdma_dump_xmsg(struct xio_msg *msg)
+{
+	trace_printk("======================================\n");
+	trace_printk("XIO MSG: %p\n", msg);
+	ceph_rdma_dump_vmsg("IN", &msg->in);
+	ceph_rdma_dump_vmsg("OUT", &msg->out);
+	trace_printk("SN: %lld, req:%p\n", msg->sn, msg->request);
+	trace_printk("TY: %d, FL:0x%llx, rcpt: %d\n",
+			msg->type, msg->flags, msg->receipt_res);
+	trace_printk("TIME: %lld\n", msg->timestamp);
+        trace_printk("CTX:%p, NEXT: %p\n", msg->user_context, msg->next);
+	trace_printk("======================================\n");
+	if (msg->next) {
+		ceph_rdma_dump_xmsg(msg->next);
+	}
 }
 
 static void *ceph_rdma_hdr_alloc(void)
@@ -303,29 +352,6 @@ static const struct file_operations xio_stats_proc_fops = {
 	.write	= xio_proc_write,
 };
 
-int ceph_xio_close_conn(struct ceph_connection *ceph_conn)
-{
-	int ret = 0;
-	struct libceph_rdma_connection *conn = NULL;
-
-	RDMA_STATS_INC(close_conn);
-#if DEBUG_LVL == DEBUG_SLOW_PATH
-	printk("%s: close connection %p\n", __func__, ceph_conn);
-#endif
-	conn = (struct libceph_rdma_connection *)ceph_conn->sock;
-	BUG_ON(list_empty(&conn->pending_msg_list) == 0);
-	BUG_ON(conn->queued_cnt);
-	BUG_ON(conn->pending_cnt);
-	conn->close_initiated_locally = true;
-	ret = xio_disconnect(conn->xio_conn);
-	//con_flag_clear(ceph_con, CON_FLAG_SOCK_CLOSED);
-
-	//con_sock_state_closed(ceph_con);
-
-	return ret;
-}
-
-/* XIO changes */
 static int ceph_rdma_alloc_msg(struct xio_processor *xp)
 {
 	struct xio_vmsg *omsg;
@@ -388,6 +414,74 @@ static void ceph_rdma_free_msg(struct xio_msg *msg)
 	return;
 }
 
+static void ceph_xio_cleanup_msg(struct libceph_rdma_connection *conn, struct xio_msg *msg, int send_next_msg)
+{
+	struct ceph_msg *m = NULL;
+	struct ceph_connection *con;
+
+	// ceph_rdma_dump_xmsg(msg);
+	if (msg->out.header.iov_base && msg->out.header.iov_len) {
+		ceph_rdma_hdr_free(msg->out.header.iov_base);
+		msg->out.header.iov_base = NULL;
+		msg->out.header.iov_len = 0;
+	}
+	ceph_rdma_free_msg(msg);
+	con = conn->ceph_con;
+
+	/*
+	 * In a chain of xio msgs, only the tail message will have pointer to
+	 * ceph_msg.
+	 */
+	m = (struct ceph_msg *)msg->user_context;
+	if (m) {
+		RDMA_STATS_INC(ow_send_comp_last_in_chain);
+		// kunmap() and pages that would have been mapped prior to send
+		ceph_xio_unmap_data_pages(m);
+		dout("got ack for seq %llu type %d at %p\n", m->hdr.seq,
+				le16_to_cpu(m->hdr.type), m);
+		//m->ack_stamp = jiffies;
+		m->ack_stamp = 0xDEADBEEF;;
+		dout("%s:%d: msg=%p, cnt=%d\n", __func__, __LINE__, m,
+				atomic_read(&m->kref.refcount));
+		BUG_ON(con != m->con);
+		mutex_lock(&con->mutex);
+		RDMA_STATS_INC(client_send_comp);
+		m->msgr_ctx = NULL;
+		ceph_msg_remove(m);
+		mutex_unlock(&con->mutex);
+	}
+	if (send_next_msg) {
+		ceph_rdma_try_sending(conn, 1);
+
+		/* Try to send any CEPH messages that were not sent because of
+		 * unavailabilty of XIO messages */
+		ceph_rdma_send(con);
+	}
+}
+
+int ceph_xio_close_conn(struct ceph_connection *ceph_conn)
+{
+	int ret = 0;
+	struct libceph_rdma_connection *conn = NULL;
+
+	RDMA_STATS_INC(close_conn);
+#if DEBUG_LVL == DEBUG_SLOW_PATH
+	printk("%s: close connection %p\n", __func__, ceph_conn);
+#endif
+	conn = (struct libceph_rdma_connection *)ceph_conn->msngr_pvt;
+	BUG_ON(list_empty(&conn->pending_msg_list) == 0);
+	BUG_ON(conn->queued_cnt);
+	BUG_ON(conn->pending_cnt);
+	conn->close_initiated_locally = true;
+	ret = xio_disconnect(conn->xio_conn);
+	//con_flag_clear(ceph_con, CON_FLAG_SOCK_CLOSED);
+
+	//con_sock_state_closed(ceph_con);
+
+	return ret;
+}
+
+/* XIO changes */
 static inline void ceph_add_sg_ent(struct xio_processor *xp, void *buf, size_t len)
 {
 	int ret;
@@ -462,18 +556,22 @@ static inline int ceph_rdma_send_for_sure(struct xio_msg *msg, struct libceph_rd
 
 	pend_msg = (struct xio_pending_msg *)&msg->in;
 	memset(pend_msg, 0, sizeof(msg->in));
+	m = msg->user_context;
 	if (msg->next != NULL) {
-		m = msg->user_context;
 		msg->user_context = NULL;
 	}
 	RDMA_STATS_INC(try_send);
 	ret = xio_send_msg(conn->xio_conn, msg);
-	if (ret) {
+	if (likely((ret == 0) || ((ret == -1) && (xio_errno() == -1)))) {
+		RDMA_STATS_INC(send_success);
+		conn->queued_cnt += msg_cnt;
+		return 0;
+	}
+	else {
 		RDMA_STATS_INC(send_err);
-		printk("%s:%d xio_send ret = %d(err: %d), Q cnt: %d, pend cnt: %d\n",
-			__func__, __LINE__, ret, xio_errno(),
-			conn->queued_cnt, conn->pending_cnt);
-		printk("%s:%d adding to pending q head\n", __func__, __LINE__);
+		trace_printk("xio_send ret = %d(err: %d), Q cnt: %d, pend cnt: %d\n",
+			ret, xio_errno(), conn->queued_cnt, conn->pending_cnt);
+		trace_printk("adding msg %p/%p to pending q head\n", msg, m);
 		RDMA_STATS_INC(add_to_pend_q);
 		INIT_LIST_HEAD(&pend_msg->list);
 		list_add(&pend_msg->list, &conn->pending_msg_list);
@@ -483,11 +581,6 @@ static inline int ceph_rdma_send_for_sure(struct xio_msg *msg, struct libceph_rd
 		RDMA_STATS_ADD(pend_q_cnt, pend_msg->msg_cnt);
 		return 1;
 	}
-	else {
-		RDMA_STATS_INC(send_success);
-		conn->queued_cnt += msg_cnt;
-		return 0;
-	}
 }
 
 static inline void ceph_rdma_try_sending(struct libceph_rdma_connection *conn, int from_complete)
@@ -496,12 +589,12 @@ static inline void ceph_rdma_try_sending(struct libceph_rdma_connection *conn, i
 	struct xio_pending_msg *pend_msg;
 	struct xio_vmsg *vmsg;
 	/* Peek into the list and see if we can send some messages */
-	//if ((list_empty(&conn->pending_msg_list) == 0) && (conn->queued_cnt <= XIO_MAX_SEND_MSG_LOW_WM)) {
 	if (from_complete == 0) {
 		printk("%s: trigger for conn %p from proc, pend list=%d, Q cnt=%d, pend cnt = %d\n", __func__, conn,
 			list_empty(&conn->pending_msg_list), conn->queued_cnt, conn->pending_cnt);
 	}
-	if (list_empty(&conn->pending_msg_list) == 0) {
+	// while ((list_empty(&conn->pending_msg_list) == 0) && (conn->queued_cnt <= XIO_MAX_SEND_MSG_LOW_WM)) {
+	if ((list_empty(&conn->pending_msg_list) == 0) && (conn->queued_cnt <= XIO_MAX_SEND_MSG_LOW_WM)) {
 		while (list_empty(&conn->pending_msg_list) == 0) {
 			struct ceph_msg *m;
 			pend_msg = list_first_entry(&conn->pending_msg_list,
@@ -527,6 +620,11 @@ static inline void ceph_rdma_try_sending(struct libceph_rdma_connection *conn, i
 						__func__, __LINE__, msg, pend_msg, conn->queued_cnt, conn->pending_cnt,
 						m->hdr.seq, m->hdr.tid);
 			}
+				trace_printk("Trying to sending msg %p/%p from pend Q. Q cnt=%d, pend cnt=%d\n",
+						msg, pend_msg, conn->queued_cnt, conn->pending_cnt);
+			if (m) {
+				trace_printk("m=%p, seq: %lld, tid: %lld\n", m, m->hdr.seq, m->hdr.tid);
+			}
 			if (ceph_rdma_send_for_sure(msg, conn, pend_msg->msg_cnt)) {
 				break;
 			}
@@ -547,7 +645,7 @@ static void ceph_rdma_send_in_ctx(void *data)
 	pend_msg = (struct xio_pending_msg *)&msg->in;
 	m = (struct ceph_msg *)msg->user_context;
 	con = m->con;
-	conn = (struct libceph_rdma_connection *)con->sock;
+	conn = (struct libceph_rdma_connection *)con->msngr_pvt;
 	if ((list_empty(&conn->pending_msg_list) == 0) || 
 			((pend_msg->msg_cnt + conn->queued_cnt) > XIO_MAX_SEND_MSG_HIGH_WM)){
 		dout("%s:%d add to pend q, pend list=%d, mc=%d, qcnt=%d(seq: %lld, tid: %lld), m=%p/%p\n", __func__,
@@ -587,7 +685,7 @@ static int ceph_rdma_send(struct ceph_connection *con)
 		}
 		if (unlikely(con->state == CON_STATE_CLOSED)) {
 			dout("%s: con %p CLOSED\n", __func__, con);
-			BUG_ON(con->sock);
+			BUG_ON(con->msngr_pvt);
 			break;
 		}
 		if (list_empty(&con->out_queue)) {
@@ -645,7 +743,7 @@ static int ceph_rdma_send(struct ceph_connection *con)
 				le32_to_cpu(m->hdr.front_len),
 				le32_to_cpu(m->hdr.middle_len), m->data_length);
 		BUG_ON(le32_to_cpu(m->hdr.front_len) != m->front.iov_len);
-		conn = (struct libceph_rdma_connection *)con->sock;
+		conn = (struct libceph_rdma_connection *)con->msngr_pvt;
 		ceph_add_sg_ent(xp, m->front.iov_base, m->front.iov_len);
 		RDMA_STATS_ADD(send_front_len, m->front.iov_len);
 		if (m->middle) {
@@ -825,7 +923,7 @@ static int ceph_rdma_on_session_event(struct xio_session *session,
 
 			// con_fault(ceph_con);
 			// con_flag_clear(con, CON_FLAG_SOCK_CLOSED);
-			ceph_con->sock = NULL;
+			ceph_con->msngr_pvt = NULL;
 
 			//con_sock_state_closed(con);
 			ceph_con->ops->put(ceph_con);
@@ -856,8 +954,27 @@ static int ceph_rdma_on_session_event(struct xio_session *session,
 			printk("%s: conn %p/%p discon, sess=%p/%p\n", 
 					__func__, xio_conn, conn, session, sess);
 #endif
-			ceph_con = (struct ceph_connection *)conn->ceph_con;
-			ceph_con_close(ceph_con);
+			/* Freeup any pending XIO messeges that are yet to be sent. */
+			while (list_empty(&conn->pending_msg_list) == 0) {
+				struct xio_msg *msg, *msg_next;
+				struct xio_pending_msg *pend_msg;
+				struct xio_vmsg *vmsg;
+				pend_msg = list_first_entry(&conn->pending_msg_list,
+						struct xio_pending_msg, list);
+				vmsg = (struct xio_vmsg *)pend_msg;
+				msg = container_of(vmsg, struct xio_msg, in);
+				RDMA_STATS_INC(rem_from_pend_q);
+				list_del(&pend_msg->list);
+				conn->pending_cnt -= pend_msg->msg_cnt;
+				RDMA_STATS_SUB(pend_q_cnt, pend_msg->msg_cnt);
+				if (msg->next) {
+					msg->user_context = NULL;
+				}
+				for (; msg; msg = msg_next) {
+					msg_next = msg->next;
+					ceph_xio_cleanup_msg(conn, msg, 0);
+				}
+			}
 			break;
 		case XIO_SESSION_CONNECTION_CLOSED_EVENT:
 			RDMA_STATS_INC(sess_conn_close);
@@ -905,50 +1022,6 @@ static int ceph_rdma_on_session_event(struct xio_session *session,
 	}
 
 	return 0;
-}
-
-static void ceph_rdma_dump_vmsg_hdr(struct xio_iovec *hdr)
-{
-	printk("HDR: base = %p, len = %zu\n", hdr->iov_base,
-			hdr->iov_len);
-}
-
-static void ceph_rdma_dump_sg_tbl(struct sg_table *data_tbl)
-{
-	int i;
-	struct scatterlist *sg;
-	printk("SG TBL: nents: %d, org nents: %d\n", data_tbl->nents, data_tbl->orig_nents);
-        sg = data_tbl->sgl;
-	for (i = 0; i < data_tbl->nents; i++) {
-                printk("%d: %p, %d\n", i, sg_virt(sg), sg->length);
-		sg = sg_next(sg);
-	}
-}
-
-static void ceph_rdma_dump_vmsg(char *str, struct xio_vmsg *vmsg)
-{
-	printk("%s vmsg: %p\n", str, vmsg);
-	ceph_rdma_dump_vmsg_hdr(&vmsg->header);
-	printk("sgl ty:%d, pad: %d\n", vmsg->sgl_type, vmsg->pad);
-	ceph_rdma_dump_sg_tbl(&vmsg->data_tbl);
-	printk("USR CTX: %p\n", vmsg->user_context);
-}
-
-static void ceph_rdma_dump_xmsg(struct xio_msg *msg)
-{
-	printk("======================================\n");
-	printk("XIO MSG: %p\n", msg);
-	ceph_rdma_dump_vmsg("IN", &msg->in);
-	ceph_rdma_dump_vmsg("OUT", &msg->out);
-	printk("SN: %lld, req:%p\n", msg->sn, msg->request);
-	printk("TY: %d, FL:0x%llx, rcpt: %d\n",
-			msg->type, msg->flags, msg->receipt_res);
-	printk("TIME: %lld\n", msg->timestamp);
-        printk("CTX:%p, NEXT: %p\n", msg->user_context, msg->next);
-	printk("======================================\n");
-	if (msg->next) {
-		ceph_rdma_dump_xmsg(msg->next);
-	}
 }
 
 /*
@@ -1132,7 +1205,12 @@ static int ceph_rdma_process_data(struct xio_msg *msg,
 	struct ceph_msg *m;
 	int ret = 0;
 
-	hdlr = &conn->hdlr;
+	if (assign_buffers) {
+		hdlr = &conn->hdlr;
+	}
+	else {
+		hdlr = &conn->inl_hdlr;
+	}
 	BUG_ON(hdlr->msg == NULL);
 	m = hdlr->msg;
 	data_len = le32_to_cpu(m->hdr.data_len);
@@ -1191,7 +1269,12 @@ static int ceph_rdma_process_headers(struct xio_msg *msg,
 	int skip = 0;
 	int ret = 0;
 
-	hdlr = &conn->hdlr;
+	if (assign_buffers) {
+		hdlr = &conn->hdlr;
+	}
+	else {
+		hdlr = &conn->inl_hdlr;
+	}
 	BUG_ON(hdlr->msg);
 	imsg = &msg->in;
 	start = imsg->header.iov_base;
@@ -1242,7 +1325,7 @@ static int ceph_rdma_process_headers(struct xio_msg *msg,
 	}
 	dout("AD: M %p got hdr type %d seq %lld front %d data %d\n", msg, m_hdr.type, m_hdr.seq, m_hdr.front_len, m_hdr.data_len);
 #if DEBUG_LVL == DEBUG_DATA_PATH
-	trace_printk("AD: M %p got hdr type %d seq %lld front %d data %d\n", msg, m_hdr.type, m_hdr.seq, m_hdr.front_len, m_hdr.data_len);
+	trace_printk("AD: MC %d %p got hdr type %d seq %lld tid %lld front %d data %d\n", hdlr->msg_chain_cnt, msg, m_hdr.type, m_hdr.seq, m_hdr.tid, m_hdr.front_len, m_hdr.data_len);
 #endif
 	// TODO Check connection state
 	// TODO - See if this can be moved to a seperate function to be used 
@@ -1363,7 +1446,12 @@ static int ceph_rdma_process_incoming_msg(struct xio_msg *msg,
 	struct ceph_msg *m;
 	int ret = 0;
 
-	hdlr = &conn->hdlr;
+	if (assign_buffers) {
+		hdlr = &conn->hdlr;
+	}
+	else {
+		hdlr = &conn->inl_hdlr;
+	}
 	ceph_init_rcvd_msg_hdlr(hdlr, msg, assign_buffers);
 	con = (struct ceph_connection *)conn->ceph_con;
 	mutex_lock(&con->mutex);
@@ -1384,13 +1472,29 @@ static int ceph_rdma_process_incoming_msg(struct xio_msg *msg,
 		}
 	}
 	else {
-		if (assign_buffers == 0) {
-			printk("hdr. res l=%d, res b=%p, sgc=%d, tot=%d, sg off=%d\n", hdlr->residual_len,
+		if (unlikely(assign_buffers == 0)) {
+			struct xio_vmsg *imsg;
+			printk("msg %p out of order?\n", msg);
+			trace_printk("msg %p out of order?\n", msg);
+			imsg = &msg->in;
+			trace_printk("hdr. res l=%d, res b=%p, sgc=%d, tot=%d, sg off=%d\n", hdlr->residual_len,
 					hdlr->residual_buf, hdlr->sg_cnt, hdlr->total_msg_len, hdlr->cur_sg_off);
-			printk("MC=%d, last sg=%p, last buf=%p, tbl=%p, sg=%p, m=%p\n", hdlr->msg_chain_cnt, hdlr->last_sg,
-					hdlr->last_buf, hdlr->tbl, hdlr->sg, hdlr->msg);
+			trace_printk("MC=%d, last sg=%p, last buf=%p, tbl=%p, sg=%p, m=%p\n", hdlr->msg_chain_cnt,
+					hdlr->last_sg, hdlr->last_buf, hdlr->tbl, hdlr->sg, hdlr->msg);
+			m = hdlr->msg;
+			if (m) {
+				trace_printk("DL=%zu, se=%lld, tid=%lld, type=%d, fl=%d, dl=%d\n", m->data_length, m->hdr.seq, m->hdr.tid,
+						m->hdr.type, m->hdr.front_len, m->hdr.data_len);
+			}
+			m = msg->user_context;
+			if (m) {
+				trace_printk("DL=%zd, se=%lld, tid=%lld, type=%d, fl=%d, dl=%d\n", m->data_length, m->hdr.seq, m->hdr.tid,
+						m->hdr.type, m->hdr.front_len, m->hdr.data_len);
+			}
 			ceph_rdma_dump_xmsg(msg);
+			mutex_unlock(&con->mutex);
 			BUG_ON(1);
+			return 1;
 		}
 	}
 
@@ -1404,7 +1508,7 @@ static int ceph_rdma_process_incoming_msg(struct xio_msg *msg,
 		msg->user_context = NULL;
 	}
 	else {
-		memset(&conn->hdlr, 0, sizeof(struct xio_rcvd_msg_hdlr));
+		memset(hdlr, 0, sizeof(struct xio_rcvd_msg_hdlr));
 		msg->user_context = (void *)m; // No need to lookup msg again
 	}
 
@@ -1452,7 +1556,10 @@ static int ceph_rdma_on_new_msg(struct xio_session *session,
 	}
 	else {
 		RDMA_STATS_INC(msg_w_inline_data);
-		ceph_rdma_process_incoming_msg(msg, conn, 0);
+		if (ceph_rdma_process_incoming_msg(msg, conn, 0)) {
+			trace_printk("Dropping message %p\n", msg);
+			xio_release_msg(msg);
+		}
 		m = (struct ceph_msg *)msg->user_context;
 	}
 
@@ -1535,10 +1642,10 @@ static int ceph_rdma_on_new_msg(struct xio_session *session,
 	     in_front_crc, in_middle_crc, in_data_crc);
 #endif
 
-	con->ops->dispatch(con, m);
-
 	/* acknowledge XIO that response is no longer needed */
 	xio_release_msg(msg);
+
+	con->ops->dispatch(con, m);
 
 	return 0;
 }
@@ -1599,7 +1706,6 @@ static int ceph_rdma_on_msg_delivered(struct xio_session *session,
 	return 0;
 }
 
-static int err_cntr=5;
 static int ceph_rdma_on_msg_error(struct xio_session *session, enum xio_status error,
 		enum xio_msg_direction dir, struct xio_msg  *msg,
 		void *conn_user_context)
@@ -1607,45 +1713,45 @@ static int ceph_rdma_on_msg_error(struct xio_session *session, enum xio_status e
 	struct libceph_rdma_connection *conn = conn_user_context;
 
 	RDMA_STATS_INC(msg_error);
-	if (err_cntr ) {
-		printk("%s: msg %p error. sess %p, error = %d, dir = %d\n",
-				__func__, msg, session, error, dir);
-		printk("conn %p, q cnt: %d, pend cnt: %d\n", conn,
-				conn->queued_cnt, conn->pending_cnt);
-		ceph_rdma_dump_xmsg(msg);
-		err_cntr--;
-	}
+	trace_printk("%s: msg %p error. sess %p, error = %d, dir = %d\n",
+			__func__, msg, session, error, dir);
+	trace_printk("conn %p, q cnt: %d, pend cnt: %d\n", conn,
+			conn->queued_cnt, conn->pending_cnt);
+	//ceph_rdma_dump_xmsg(msg);
+	
+	conn->queued_cnt--;
+	ceph_xio_cleanup_msg(conn, msg, 0);
 	return 0;
 }
 
 /* requester's message cancelation notification */
-static int ceph_rdma_on_cancel(struct xio_session *session,
-		struct xio_msg *msg, enum xio_status result,
-		void *conn_user_context)
+static int ceph_rdma_on_cancel(struct xio_session *session, struct xio_msg *msg,
+	enum xio_status result, void *conn_user_context)
 {
 	RDMA_STATS_INC(msg_cancel);
 #if DEBUG_LVL == DEBUG_SLOW_PATH
-	printk("%s: msg %p cancel req. sess %p, uc=%p\n", __func__, msg,
-			session, conn_user_context);
+	printk("%s: msg %p cancel req. res = %d, sess %p, uc=%p\n", __func__, msg,
+		result, session, conn_user_context);
 #endif
 	ceph_rdma_dump_xmsg(msg);
 	return 0;
 }
 
 /* responder's message cancelation notification */
-static int ceph_rdma_on_cancel_request(struct xio_session *session,
-		struct xio_msg *msg, void *conn_user_context)
+static int ceph_rdma_on_cancel_request(struct xio_session *session, struct xio_msg *msg,
+	void *conn_user_context)
 {
 	RDMA_STATS_INC(msg_cancel_req);
 #if DEBUG_LVL == DEBUG_SLOW_PATH
-	printk("%s: msg %p cancel req. sess %p, uc=%p\n", __func__, msg,
-			session, conn_user_context);
+	printk("%s: msg %p cancel req. sess %p, uc=%p\n", __func__, msg, session,
+		conn_user_context);
 #endif
 	ceph_rdma_dump_xmsg(msg);
 	return 0;
 }
 
-static void ceph_rdma_validate_out_msg(struct xio_msg *msg, int tot_len, struct xio_rcvd_msg_hdlr *old_hdlr, struct xio_rcvd_msg_hdlr *hdlr)
+static void ceph_rdma_validate_out_msg(struct xio_msg *msg, int tot_len,
+	struct xio_rcvd_msg_hdlr *old_hdlr, struct xio_rcvd_msg_hdlr *hdlr)
 {
 	struct xio_vmsg *vmsg;
 	struct sg_table *data_tbl;
@@ -1739,52 +1845,14 @@ static int ceph_rdma_on_ow_msg_send_complete(struct xio_session *session,
 		struct xio_msg *msg, void *conn_user_context)
 {
 	struct libceph_rdma_connection *conn;
-	struct ceph_msg *m = NULL;
-	struct ceph_connection *con;
 
 	RDMA_STATS_INC(ow_send_comp);
 	dout("%s: ow msg %p send comp. sess=%p, uc=%p\n",
 			__func__, msg, session, conn_user_context);
-	// ceph_rdma_dump_xmsg(msg);
 	conn = (struct libceph_rdma_connection *)conn_user_context;
 	conn->last_sent_sn = msg->sn;
-	m = (struct ceph_msg *)msg->user_context;
-	if (msg->out.header.iov_base && msg->out.header.iov_len) {
-		ceph_rdma_hdr_free(msg->out.header.iov_base);
-		msg->out.header.iov_base = NULL;
-		msg->out.header.iov_len = 0;
-	}
-	ceph_rdma_free_msg(msg);
-	con = conn->ceph_con;
-
-	/*
-	 * In a chain of xio msgs, only the tail message will have pointer to
-	 * ceph_msg.
-	 */
-	if (m) {
-		RDMA_STATS_INC(ow_send_comp_last_in_chain);
-		// kunmap() and pages that would have been mapped prior to send
-		ceph_xio_unmap_data_pages(m);
-		dout("got ack for seq %llu type %d at %p\n", m->hdr.seq,
-				le16_to_cpu(m->hdr.type), m);
-		//m->ack_stamp = jiffies;
-		m->ack_stamp = 0xDEADBEEF;;
-		dout("%s:%d: msg=%p, cnt=%d\n", __func__, __LINE__, m,
-				atomic_read(&m->kref.refcount));
-		BUG_ON(con != m->con);
-		mutex_lock(&con->mutex);
-		RDMA_STATS_INC(client_send_comp);
-		ceph_msg_remove(m);
-		mutex_unlock(&con->mutex);
-		if (!list_empty(&m->list_head)) {
-			printk("%s:%d m=%p still in list!!\n", __func__, __LINE__, m);
-		}
-	}
 	conn->queued_cnt--;
-	ceph_rdma_try_sending(conn, 1);
-
-	/* Try to send any CEPH messages that were not sent because of unavailabilty of XIO messages */
-	ceph_rdma_send(con);
+	ceph_xio_cleanup_msg(conn, msg, 1);
 
 	return 0;
 }
@@ -1954,7 +2022,7 @@ static int ceph_rdma_connect(struct ceph_connection *con)
 	atomic_inc(&sess->conn_count);
 	mutex_unlock(&sess->conn_list_lock);
 	conn->addr = paddr;
-	con->sock = (struct socket *)conn; //TODO
+	con->msngr_pvt = (void *)conn; //TODO
 	conn->ceph_con = con;
 	INIT_LIST_HEAD(&conn->pending_msg_list);
 	conn->queued_cnt = 0;
@@ -1975,7 +2043,7 @@ static int ceph_rdma_open(struct ceph_connection *con)
 	mutex_lock(&con->mutex);
 	BUG_ON(con->state != CON_STATE_PREOPEN);
 	dout("%s: con %p PREOPEN\n", __func__, con);
-	BUG_ON(con->sock);
+	BUG_ON(con->msngr_pvt);
 	con->state = CON_STATE_CONNECTING;
 
 	dout("initiating connect on %p new state %lu\n",
@@ -1997,6 +2065,23 @@ static int ceph_rdma_open(struct ceph_connection *con)
 
 static int ceph_rdma_out_msg_cancel(struct ceph_msg *m)
 {
+#if 0
+	struct xio_msg *msg;
+	struct ceph_connection *ceph_con;
+	struct libceph_rdma_connection *conn;
+
+	trace_printk("msg = %p, ctx = %p \n", m, m->msgr_ctx);
+	ceph_con = m->con;
+	conn = (struct libceph_rdma_connection *)ceph_con->msngr_pvt;
+	if (m->msgr_ctx) {
+		for (msg = (struct xio_msg *)m->msgr_ctx; msg; msg = msg->next) {
+			trace_printk("Issuing cancel for xio msg %p\n", msg);
+			xio_cancel_request(conn->xio_conn, msg);
+		}
+	}
+#endif
+	// TODO
+	dout("%s:%d msg = %p returning for RDMA\n", __func__, __LINE__, m);
 	return 0;
 }
 

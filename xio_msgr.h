@@ -62,6 +62,7 @@ struct libceph_rdma_connection {
 	bool close_initiated_locally;
 
 	struct xio_rcvd_msg_hdlr hdlr;
+	struct xio_rcvd_msg_hdlr inl_hdlr;
 };
 
 struct xio_processor {
