@@ -1,3 +1,7 @@
+/*
+ * Copyright © SanDisk Corp. 2015 - All rights reserved.
+ */
+
 #ifndef _XIO_MSGR_H_
 #define _XIO_MSGR_H_
 
@@ -63,6 +67,10 @@ struct libceph_rdma_connection {
 
 	struct xio_rcvd_msg_hdlr hdlr;
 	struct xio_rcvd_msg_hdlr inl_hdlr;
+	u64 send_total_req;
+	u64 send_total_time;
+	u64 send_min_time;
+	u64 send_max_time;
 };
 
 struct xio_processor {
@@ -73,6 +81,8 @@ struct xio_processor {
 	int i;
 	void *last_buf;
 	struct scatterlist *last_sg;
+	int total_msg_len;
+	int remain_len;
 };
 
 struct xio_pending_msg {
