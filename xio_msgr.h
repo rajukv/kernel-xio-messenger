@@ -31,6 +31,8 @@ struct libceph_rdma_session {
 	struct mutex conn_list_lock;
 	atomic_t conn_count;
 	char portal[MAX_PORTAL_NAME];
+
+	/* This is to map multiple ceph connections to mons to the same backend xio connection */
 	struct kref kref;
 	struct libceph_rdma_connection *rdma_conn;
 	struct task_struct *sess_th;

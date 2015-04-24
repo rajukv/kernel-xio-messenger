@@ -467,6 +467,7 @@ static void ceph_xio_cleanup_msg(struct libceph_rdma_connection *conn, struct xi
 		ceph_xio_unmap_data_pages(m);
 		dout("got ack for seq %llu type %d at %p\n", m->hdr.seq,
 				le16_to_cpu(m->hdr.type), m);
+//		trace_printk("%p:OW: m %p, seq: %lld, tid: %lld\n", conn, m, m->hdr.seq, m->hdr.tid);
 		m->ack_stamp = jiffies;
 		dout("%s:%d: msg=%p, cnt=%d\n", __func__, __LINE__, m,
 				atomic_read(&m->kref.refcount));
@@ -642,6 +643,7 @@ static inline int ceph_rdma_send_for_sure(struct xio_msg *msg, struct libceph_rd
 #endif
 	ret = xio_send_msg(conn->xio_conn, msg);
 	if (likely((ret == 0) || ((ret == -1) && (xio_errno() == -1)))) {
+//		trace_printk("%p:SN: xio msg %p/m %p, dl=%d, mc:%d, seq: %lld, tid: %lld\n", conn, msg, m, m->data_length, msg_cnt, m->hdr.seq, m->hdr.tid);
 		RDMA_STATS_INC(send_success);
 		conn->queued_cnt += msg_cnt;
 		return 0;
@@ -818,7 +820,7 @@ static int ceph_rdma_send(struct ceph_connection *con)
 			WARN_ON(1);
 		}
 
-		m->ack_stamp = 0x12345678;
+		m->ack_stamp = jiffies;
 		dout("%s:%d %p seq %lld type %d len %d+%d+%zd\n",
 				__func__, __LINE__, m, con->out_seq,
 				le16_to_cpu(m->hdr.type),
@@ -1373,7 +1375,12 @@ static int ceph_rdma_process_headers(struct xio_msg *msg,
 	imsg = &msg->in;
 	start = imsg->header.iov_base;
 	p = start;
-	BUG_ON((p == NULL) || (imsg->header.iov_len == 0));
+	if (unlikely((p == NULL) || (imsg->header.iov_len == 0))) {
+		printk("p=%p, l=%d\n", p, imsg->header.iov_len);
+		ceph_rdma_dump_xmsg(msg);
+		WARN_ON(1);
+		return -EBADMSG;
+	}
 	end = p + imsg->header.iov_len;
 	ceph_decode_need(&p, end, 2 * sizeof(32) + sizeof(struct ceph_entity_addr), bad);
 	hdlr->msg_chain_cnt = ceph_decode_32(&p);
@@ -1424,6 +1431,8 @@ static int ceph_rdma_process_headers(struct xio_msg *msg,
 	trace_printk("AD: MC %d %p got hdr type %d seq %lld tid %lld front %d data %d\n",
 		hdlr->msg_chain_cnt, msg, m_hdr.type, m_hdr.seq, m_hdr.tid, m_hdr.front_len, m_hdr.data_len);
 #endif
+	// trace_printk("%p: %s: MC %d %p got hdr type %d seq %lld tid %lld front %d data %d\n", conn, assign_buffers ? "AD" : "NM",
+	//	hdlr->msg_chain_cnt, msg, m_hdr.type, m_hdr.seq, m_hdr.tid, m_hdr.front_len, m_hdr.data_len);
 	// TODO Check connection state
 	// TODO - See if this can be moved to a seperate function to be used 
 	// both socket & xio
@@ -1543,6 +1552,9 @@ static int ceph_rdma_process_incoming_msg(struct xio_msg *msg,
 	struct ceph_msg *m;
 	int ret = 0;
 
+	/* We have seperate handlers for XIO msgs with inline data and assign buffers. This is to handle a case where
+	   XIO msg with inline data can comes after completing processing of XIO msg with assign buffers(before the actual
+	   new msg arrives for these XIO msgs */
 	if (assign_buffers) {
 		hdlr = &conn->hdlr;
 	}
@@ -1743,11 +1755,12 @@ static int ceph_rdma_on_new_msg(struct xio_session *session,
 	     le32_to_cpu(m->hdr.data_len),
 	     in_front_crc, in_middle_crc, in_data_crc);
 #endif
+	// trace_printk("%p: COMP: %p seq %llu tid %llu\n", conn, m, m->hdr.seq, m->hdr.tid);
+
+	con->ops->dispatch(con, m);
 
 	/* acknowledge XIO that response is no longer needed */
 	xio_release_msg(msg);
-
-	con->ops->dispatch(con, m);
 
 	return 0;
 }
@@ -2032,11 +2045,18 @@ cleanup:
 	do_exit(0);
 }
 
-static struct libceph_rdma_session *ceph_rdma_session_create(const char *portal)
+static struct libceph_rdma_session *ceph_rdma_session_create(const char *portal, int reuse_xio_conn)
 {
-	struct libceph_rdma_session *sess;
+	struct libceph_rdma_session *sess = NULL;
 	struct xio_session_params params;
 
+	if (reuse_xio_conn) {
+		sess = ceph_rdma_session_find_by_portal(&g_libceph_sessions, portal);	
+		if (sess) {
+			kref_get(&sess->kref);
+			return sess;
+		}
+	}
 	sess = kzalloc(sizeof(struct libceph_rdma_session), GFP_KERNEL);
 	if (unlikely(!sess)) {
 		printk("failed to allocate libceph rdma session\n");
@@ -2068,7 +2088,6 @@ static struct libceph_rdma_session *ceph_rdma_session_create(const char *portal)
 	return sess;
 }
 
-#if 0
 static struct libceph_rdma_session *ceph_rdma_session_find_by_portal(struct list_head *s_data_list, const char *portal)
 {
 	struct libceph_rdma_session *pos;
@@ -2085,7 +2104,6 @@ static struct libceph_rdma_session *ceph_rdma_session_find_by_portal(struct list
 
 	return ret;
 }
-#endif
 
 void libceph_rdma_session_last_put(struct kref *kref)
 {
@@ -2113,10 +2131,16 @@ static int ceph_rdma_connect(struct ceph_connection *con)
 	struct libceph_rdma_connection *conn = NULL;
 	char name[50];
 	struct xio_connection_params cparams;
+	int reuse_xio_conn = 0;
 
 	RDMA_STATS_INC(open_conn);
 	snprintf(rdma, MAX_PORTAL_NAME, "rdma://%s", ceph_pr_addr(paddr));
-	sess = ceph_rdma_session_create(rdma);
+#if 0
+	if (con->peer_name.type == CEPH_ENTITY_TYPE_MON) {
+		resuse_xio_conn = 1;
+	}
+#endif
+	sess = ceph_rdma_session_create(rdma, resuse_xio_conn);
 	if (unlikely(sess == NULL)) {
 		printk("Couldn't create new session with %s\n", rdma);
 		return -EINVAL;
@@ -2193,7 +2217,7 @@ static int ceph_rdma_open(struct ceph_connection *con)
 	}
 	mutex_unlock(&con->mutex);
 
-	return 0;
+	return ret;
 }
 
 static int ceph_rdma_out_msg_cancel(struct ceph_msg *m)

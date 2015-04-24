@@ -2,7 +2,8 @@
 #
 # Makefile for CEPH XIO messenger.
 #
-EXTRA_CFLAGS := -I/root/raju/accelio/include -DENABLE_XIO -DXIO_PERF -DUSE_WQ -O0  -ggdb -g3 -gdwarf-4
+#EXTRA_CFLAGS := -I/root/raju/accelio/include -DXIO_PERF -DUSE_WQ -O0  -ggdb -g3 -gdwarf-4
+EXTRA_CFLAGS := -I/root/raju/accelio/include -DXIO_PERF -O0  -ggdb -g3 -gdwarf-4
 
 obj-$(CONFIG_CEPH_LIB) += xio_msgr.o
 
