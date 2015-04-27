@@ -493,10 +493,10 @@ int ceph_xio_close_conn(struct ceph_connection *ceph_conn)
 	struct libceph_rdma_connection *conn = NULL;
 
 	RDMA_STATS_INC(close_conn);
-#if DEBUG_LVL == DEBUG_SLOW_PATH
-	printk("%s: close connection %p\n", __func__, ceph_conn);
-#endif
 	conn = (struct libceph_rdma_connection *)ceph_conn->msngr_pvt;
+#if DEBUG_LVL == DEBUG_SLOW_PATH
+	printk("%s: close connection ceph %p/rdma %p\n", __func__, ceph_conn, conn);
+#endif
 	BUG_ON(list_empty(&conn->pending_msg_list) == 0);
 	BUG_ON(conn->queued_cnt);
 	BUG_ON(conn->pending_cnt);
@@ -951,6 +951,21 @@ static int ceph_rdma_send(struct ceph_connection *con)
 	return 0;
 }
 
+static void ceph_rdma_session_free(struct libceph_rdma_session *sess)
+{
+	if (sess->ctx) {
+		xio_context_destroy(sess->ctx);
+	}
+	/* Remove from global session list */
+	mutex_lock(&g_libceph_lock);
+	list_del(&sess->list);
+	mutex_unlock(&g_libceph_lock);
+	RDMA_STATS_INC(sess_free);
+	kfree(sess);
+
+	return;
+}
+
 static int ceph_rdma_on_session_event(struct xio_session *session,
 		struct xio_session_event_data *event_data,
 		void *cb_user_context)
@@ -1041,8 +1056,14 @@ static int ceph_rdma_on_session_event(struct xio_session *session,
 					__func__, __LINE__, session, sess);
 #endif
 			BUG_ON(list_empty(&sess->conn_list) == 0);
+			libceph_rdma_session_put(sess);
 			xio_context_stop_loop(sess->ctx);
+#ifdef USE_WQ
+			/* Destroy the session when the loop stops */
+			ceph_rdma_session_free(sess);
+#else
 			/* Continue cleanup in ceph_rdma_session_work() */
+#endif
 			break;
 
 		case XIO_SESSION_CONNECTION_DISCONNECTED_EVENT:
@@ -1997,20 +2018,7 @@ struct xio_session_ops ceph_rdma_ses_ops = {
 	.on_ow_msg_send_complete	=  ceph_rdma_on_ow_msg_send_complete,
 };
 
-static void ceph_rdma_session_free(struct libceph_rdma_session *sess)
-{
-	if (sess->ctx) {
-		xio_context_destroy(sess->ctx);
-	}
-	mutex_lock(&g_libceph_lock);
-	list_del(&sess->list);
-	mutex_unlock(&g_libceph_lock);
-	RDMA_STATS_INC(sess_free);
-	kfree(sess);
-
-	return;
-}
-
+#ifndef USE_WQ
 static int ceph_rdma_session_work(void *data)
 {
 	struct libceph_rdma_session *sess = data;
@@ -2043,6 +2051,24 @@ cleanup:
 	/* Destroy the session when the loop stops */
 	ceph_rdma_session_free(sess);
 	do_exit(0);
+}
+#endif
+
+static struct libceph_rdma_session *ceph_rdma_session_find_by_portal(struct list_head *s_data_list, const char *portal)
+{
+	struct libceph_rdma_session *pos;
+	struct libceph_rdma_session *ret = NULL;
+
+	mutex_lock(&g_libceph_lock);
+	list_for_each_entry(pos, &g_libceph_sessions, list) {
+		if (!strcmp(pos->portal, portal)) {
+			ret = pos;
+			break;
+		}
+	}
+	mutex_unlock(&g_libceph_lock);
+
+	return ret;
 }
 
 static struct libceph_rdma_session *ceph_rdma_session_create(const char *portal, int reuse_xio_conn)
@@ -2088,23 +2114,6 @@ static struct libceph_rdma_session *ceph_rdma_session_create(const char *portal,
 	return sess;
 }
 
-static struct libceph_rdma_session *ceph_rdma_session_find_by_portal(struct list_head *s_data_list, const char *portal)
-{
-	struct libceph_rdma_session *pos;
-	struct libceph_rdma_session *ret = NULL;
-
-	mutex_lock(&g_libceph_lock);
-	list_for_each_entry(pos, &g_libceph_sessions, list) {
-		if (!strcmp(pos->portal, portal)) {
-			ret = pos;
-			break;
-		}
-	}
-	mutex_unlock(&g_libceph_lock);
-
-	return ret;
-}
-
 void libceph_rdma_session_last_put(struct kref *kref)
 {
 	struct libceph_rdma_session *sess = container_of(kref, struct libceph_rdma_session, kref);
@@ -2112,10 +2121,6 @@ void libceph_rdma_session_last_put(struct kref *kref)
 	RDMA_STATS_INC(sess_destroy);
 	BUG_ON(list_empty(&sess->conn_list) == 0);
 
-	/* Remove from global session list */
-	mutex_lock(&g_libceph_lock);
-	list_del(&sess->list);
-	mutex_unlock(&g_libceph_lock);
 #if DEBUG_LVL == DEBUG_SLOW_PATH
 	printk("Destroying session %p/%p\n", sess->session, sess);
 #endif
@@ -2137,10 +2142,10 @@ static int ceph_rdma_connect(struct ceph_connection *con)
 	snprintf(rdma, MAX_PORTAL_NAME, "rdma://%s", ceph_pr_addr(paddr));
 #if 0
 	if (con->peer_name.type == CEPH_ENTITY_TYPE_MON) {
-		resuse_xio_conn = 1;
+		reuse_xio_conn = 1;
 	}
 #endif
-	sess = ceph_rdma_session_create(rdma, resuse_xio_conn);
+	sess = ceph_rdma_session_create(rdma, reuse_xio_conn);
 	if (unlikely(sess == NULL)) {
 		printk("Couldn't create new session with %s\n", rdma);
 		return -EINVAL;
@@ -2307,7 +2312,7 @@ static int __init ceph_xio_msgr_init(void)
 
 	proc_create("xio_stats", 0, NULL, &xio_stats_proc_fops);
 
-	register_reboot_notifier(&ceph_rdma_xio_reboot_notifier);
+	// register_reboot_notifier(&ceph_rdma_xio_reboot_notifier);
 
 	ceph_rdma_header_buf_cache = kmem_cache_create("ceph_rdma_hdr_buf", XIO_HDR_LEN,
 		__alignof__(XIO_HDR_LEN), 0, NULL);
