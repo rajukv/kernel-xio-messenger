@@ -37,6 +37,7 @@ struct libceph_rdma_session {
 	struct libceph_rdma_connection *rdma_conn;
 	struct task_struct *sess_th;
 	struct xio_context *ctx;
+	struct work_struct sess_destroy_work;
 };
 
 struct xio_rcvd_msg_hdlr {
