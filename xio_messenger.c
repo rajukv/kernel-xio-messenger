@@ -112,7 +112,6 @@ static struct xio_ev_data trigger_event;
 
 static inline int ceph_rcvd_msg_add_sg(struct xio_rcvd_msg_hdlr *hdlr, void *buf, int len);
 static void ceph_rdma_trigger_send_on_conn(void *data);
-static int ceph_rdma_xio_reboot(struct notifier_block *nb, unsigned long event, void *ptr);
 static int ceph_rdma_on_new_msg(struct xio_session *session,
 		struct xio_msg *msg, int more_in_batch, void *cb_user_context);
 static void ceph_xio_unmap_data_pages(struct ceph_msg *m);
@@ -132,6 +131,8 @@ extern u32 ceph_crc32c_page(u32 crc, struct page *page,
 				unsigned int length);
 extern void ceph_msg_remove(struct ceph_msg *msg);
 
+#if 0
+static int ceph_rdma_xio_reboot(struct notifier_block *nb, unsigned long event, void *ptr);
 static struct notifier_block ceph_rdma_xio_reboot_notifier = {
 	.notifier_call = ceph_rdma_xio_reboot,
 	.priority = 0,
@@ -142,6 +143,7 @@ static int ceph_rdma_xio_reboot(struct notifier_block *nb, unsigned long event, 
 	printk("%s:%d: Reboot notifier called. event = %lu\n", __func__, __LINE__, event);
 	return (NOTIFY_OK);
 }
+#endif
 
 static void ceph_rdma_dump_vmsg_hdr(struct xio_iovec *hdr)
 {
@@ -2037,9 +2039,13 @@ static int ceph_rdma_session_work(void *data)
 	struct libceph_rdma_session *sess = data;
 	struct xio_connection_params cparams;
 	struct libceph_rdma_connection *conn;
+	struct xio_context_params ctx_params;
 
 	conn = sess->rdma_conn;
-	sess->ctx = xio_context_create(XIO_LOOP_GIVEN_THREAD, NULL, current, 0, /* cpu id  - get_cpu() */ -1);
+	memset(&ctx_params, 0, sizeof(ctx_params));
+        ctx_params.flags = XIO_LOOP_GIVEN_THREAD;
+        ctx_params.worker = current;
+	sess->ctx = xio_context_create(&ctx_params, 0, -1);
 	if (unlikely(sess->ctx == NULL)) {
 		printk("context open failed\n");
 		goto cleanup;
@@ -2144,6 +2150,7 @@ static int ceph_rdma_connect(struct ceph_connection *con)
 	char name[50];
 	struct xio_connection_params cparams;
 	int reuse_xio_conn = 0;
+	struct xio_context_params ctx_params;
 
 	RDMA_STATS_INC(open_conn);
 	snprintf(rdma, MAX_PORTAL_NAME, "rdma://%s", ceph_pr_addr(paddr));
@@ -2181,7 +2188,10 @@ static int ceph_rdma_connect(struct ceph_connection *con)
 	sess->rdma_conn = conn;
 	conn->send_min_time = (u64)-1;
 #ifdef USE_WQ
-	sess->ctx = xio_context_create(XIO_LOOP_WORKQUEUE, NULL, current, 0, /* cpu id  - get_cpu() */ -1);
+	memset(&ctx_params, 0, sizeof(ctx_params));
+        ctx_params.flags = XIO_LOOP_WORKQUEUE;
+        ctx_params.worker = current;
+	sess->ctx = xio_context_create(&ctx_params, 0, -1);
 	if (unlikely(sess->ctx == NULL)) {
 		printk("context open failed\n");
 		BUG_ON(1);
@@ -2311,10 +2321,10 @@ static int __init ceph_xio_msgr_init(void)
 			&xopt, sizeof(xopt));
 
 	xopt = XIO_HDR_LEN;
-	xio_set_opt(NULL, XIO_OPTLEVEL_ACCELIO, XIO_OPTNAME_MAX_INLINE_HEADER,
+	xio_set_opt(NULL, XIO_OPTLEVEL_ACCELIO, XIO_OPTNAME_MAX_INLINE_XIO_HEADER,
 			&xopt, sizeof(xopt));
 	xopt = 16384;
-	xio_set_opt(NULL, XIO_OPTLEVEL_ACCELIO, XIO_OPTNAME_MAX_INLINE_DATA,
+	xio_set_opt(NULL, XIO_OPTLEVEL_ACCELIO, XIO_OPTNAME_MAX_INLINE_XIO_DATA,
 			&xopt, sizeof(xopt));
 
 	proc_create("xio_stats", 0, NULL, &xio_stats_proc_fops);
