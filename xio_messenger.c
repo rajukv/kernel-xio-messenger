@@ -1408,7 +1408,7 @@ static int ceph_rdma_process_headers(struct xio_msg *msg,
 	start = imsg->header.iov_base;
 	p = start;
 	if (unlikely((p == NULL) || (imsg->header.iov_len == 0))) {
-		printk("p=%p, l=%d\n", p, imsg->header.iov_len);
+		printk("p=%p, l=%zd\n", p, imsg->header.iov_len);
 		ceph_rdma_dump_xmsg(msg);
 		WARN_ON(1);
 		return -EBADMSG;
@@ -1666,10 +1666,10 @@ static int ceph_rdma_on_new_msg(struct xio_session *session,
 	struct libceph_rdma_connection *conn = cb_user_context;
 	struct ceph_connection *con;
 	struct ceph_msg *m;
-	bool do_datacrc;
-	u32 crc;
+	//bool do_datacrc;
+	//u32 crc;
 	u32 in_front_crc = 0, in_middle_crc = 0, in_data_crc = 0;
-	unsigned int data_len;
+	//unsigned int data_len;
 	struct xio_vmsg *imsg, *omsg;
 
 	dout("%s: rcvd msg %p on sess %p. more = %d, uc=%p\n", __func__,
@@ -2147,7 +2147,9 @@ static int ceph_rdma_connect(struct ceph_connection *con)
 	char rdma[MAX_PORTAL_NAME];
 	struct libceph_rdma_session *sess = NULL;
 	struct libceph_rdma_connection *conn = NULL;
+#ifndef USE_WQ
 	char name[50];
+#endif
 	struct xio_connection_params cparams;
 	int reuse_xio_conn = 0;
 	struct xio_context_params ctx_params;
